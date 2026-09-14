@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>ZeroFootprint - Personal Identity & Attack Surface Auditor</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f19; color: #f1f5f9; display: flex; height: 100vh; overflow: hidden; }
+    #sidebar { width: 340px; min-width: 340px; padding: 22px; background: #111827; border-right: 1px solid #1f2937; display: flex; flex-direction: column; gap: 14px; z-index: 10; overflow-y: auto; }
+    #graph { flex: 1; height: 100%; position: relative; }
+    #inspector { width: 380px; min-width: 380px; padding: 22px; background: #111827; border-left: 1px solid #1f2937; display: none; flex-direction: column; gap: 14px; overflow-y: auto; }
+
+    input, button, textarea { width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid #374151; background: #1f2937; color: white; font-size: 13px; }
+    button { background: #2563eb; border: none; cursor: pointer; font-weight: 600; }
+    button:hover { background: #1d4ed8; }
+
+    .score-box { border-radius: 8px; padding: 12px; text-align: center; border: 1px solid #374151; background: #0f172a; margin-top: 4px; }
+    .score-val { font-size: 32px; font-weight: 800; margin: 2px 0; }
+    .card { background: #1f2937; border-radius: 8px; padding: 12px; border: 1px solid #374151; }
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 9999px; font-size: 11px; font-weight: bold; }
+    .badge-exposed { background: #065f46; color: #34d399; }
+    .badge-meta { background: #78350f; color: #fcd34d; }
+    .badge-leak { background: #7f1d1d; color: #f87171; }
+    .status-text { font-size: 12px; color: #9ca3af; line-height: 1.4; }
+  </style>
+</head>
+<body>
+
+  <div id="sidebar">
+    <h2 style="margin: 0; font-size: 18px; color: #60a5fa;">ZeroFootprint Auditor</h2>
+    <p class="status-text" style="margin: 0;">Map exposed endpoints, biometric overlaps, and unstripped EXIF metadata.</p>
+    
+    <label style="font-size: 12px; font-weight: 600; text-transform: uppercase; color: #9ca3af;">Target Alias:</label>
+    <input type="text" id="target_user" placeholder="e.g. octocat" required>
+    
+    <label style="font-size: 12px; font-weight: 600; text-transform: uppercase; color: #9ca3af;">Anchor Avatar (Optional):</label>
+    <input type="file" id="target_avatar" accept="image/*">
+
+    <button onclick="runAudit()">Audit Attack Surface</button>
+    <div id="status" class="status-text">Docker & Qdrant Connected.</div>
+
+    <div id="score_container" class="score-box" style="display: none;">
+      <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8;">Attack Surface Score</div>
+      <div id="score_num" class="score-val">0</div>
+      <div id="score_label" style="font-size: 11px; font-weight: bold;">LOW EXPOSURE</div>
+    </div>
+
+    <button id="btn_export" onclick="exportReport()" style="display: none; background: #374151;">Export JSON Audit Report</button>
+  </div>
+
+  <div id="graph"></div>
+
+  <div id="inspector">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <h3 id="panel_title" style="margin: 0; font-size: 16px;">Node Inspector</h3>
+      <button onclick="closeInspector()" style="width: auto; padding: 4px 8px; font-size: 12px; background: transparent; border: 1px solid #4b5563;">?</button>
+    </div>
+
+    <div id="panel_content" class="card"></div>
+
+    <div class="card">
+      <h4 style="margin: 0 0 6px 0; font-size: 13px;">Remediation Request</h4>
+      <textarea id="remediation_letter" rows="8" readonly style="font-size: 11px; font-family: monospace;"></textarea>
+      <button onclick="copyLetter()" style="margin-top: 8px; background: #374151;">Copy Notice to Clipboard</button>
+    </div>
+  </div>
+
+  <script>
+    let cy = null;
+    let latestReport = null;
+
+    async function runAudit() {
+      const user = document.getElementById("target_user").value.trim();
+      const file = document.getElementById("target_avatar").files[0];
+      const status = document.getElementById("status");
+
+      if (!user) return alert("Please enter a username");
+      status.innerText = "Enumerating accounts, extracting EXIF & vectors...";
+      closeInspector();
+
+      const fd = new FormData();
+      fd.append("username", user);
+      if (file) fd.append("avatar", file);
+
+      try {
+        const res = await fetch("/api/audit", { method: "POST", body: fd });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => null);
+          const errMsg = errData?.error || `Server responded with status ${res.status}`;
+          throw new Error(errMsg);
+        }
+
+        const data = await res.json();
+        latestReport = data;
+
+        status.innerText = `Audit complete. Found ${data.exposure_count} endpoints.`;
+        renderScore(data.exposure_score);
+        document.getElementById("btn_export").style.display = "block";
+
+        cy = cytoscape({
+          container: document.getElementById('graph'),
+          elements: data.elements,
+          style: [
+            { selector: 'node[type="root"]', style: { 'background-color': '#3b82f6', 'label': 'data(label)', 'color': '#fff', 'font-size': '11px', 'width': 42, 'height': 42 } },
+            { selector: 'node[type="platform"]', style: { 'background-color': '#10b981', 'label': 'data(label)', 'color': '#fff', 'font-size': '10px', 'width': 32, 'height': 32 } },
+            { selector: 'node[type="meta"]', style: { 'background-color': '#f59e0b', 'label': 'data(label)', 'color': '#fff', 'font-size': '10px', 'width': 30, 'height': 30 } },
+            { selector: 'node[type="leak"]', style: { 'background-color': '#ef4444', 'label': 'data(label)', 'color': '#fff', 'font-size': '10px', 'width': 36, 'height': 36 } },
+            { selector: 'edge', style: { 'line-color': '#374151', 'label': 'data(label)', 'color': '#9ca3af', 'font-size': '8px', 'curve-style': 'bezier', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#374151' } }
+          ],
+          layout: { name: 'cose', animate: true, padding: 35 }
+        });
+
+        cy.on('tap', 'node', function(evt){
+          openInspector(evt.target.data(), data.target);
+        });
+
+      } catch (err) {
+        status.innerText = "Audit failed: " + err.message;
+      }
+    }
+
+    function renderScore(score) {
+      const box = document.getElementById("score_container");
+      const num = document.getElementById("score_num");
+      const lbl = document.getElementById("score_label");
+      box.style.display = "block";
+      num.innerText = score;
+
+      if (score >= 70) {
+        num.style.color = "#ef4444";
+        lbl.innerText = "CRITICAL EXPOSURE";
+        lbl.style.color = "#ef4444";
+      } else if (score >= 35) {
+        num.style.color = "#f59e0b";
+        lbl.innerText = "MODERATE FOOTPRINT";
+        lbl.style.color = "#f59e0b";
+      } else {
+        num.style.color = "#10b981";
+        lbl.innerText = "LOW FOOTPRINT";
+        lbl.style.color = "#10b981";
+      }
+    }
+
+    function openInspector(data, target) {
+      const panel = document.getElementById("inspector");
+      const title = document.getElementById("panel_title");
+      const content = document.getElementById("panel_content");
+      const letter = document.getElementById("remediation_letter");
+
+      title.innerText = data.label;
+      panel.style.display = "flex";
+
+      if (data.type === "platform") {
+        content.innerHTML = `
+          <span class="badge badge-exposed">Public Endpoint</span>
+          <p style="margin: 8px 0; font-size: 13px;"><strong>Profile:</strong> <a href="${data.url}" target="_blank" style="color: #60a5fa;">${data.url}</a></p>
+          ${data.avatar_url ? `<p style="font-size: 12px; margin: 4px 0;"><strong>Avatar:</strong> <a href="${data.avatar_url}" target="_blank" style="color: #60a5fa;">Scraped Image</a></p>` : ''}
+        `;
+        letter.value = `Subject: GDPR Article 17 Erasure Request / CCPA Deletion Notice\n\nTo the Data Privacy Officer at ${data.label},\n\nI am formally requesting the permanent deletion of all personal data, telemetry, and records associated with identifier "${target}" (${data.url}) pursuant to GDPR Article 17 and CCPA § 1798.105.\n\nPlease confirm compliance within 30 days.\n\nRegards,\n[Your Name]`;
+      } else if (data.type === "meta") {
+        content.innerHTML = `
+          <span class="badge badge-meta">Metadata Leak</span>
+          <p style="margin: 8px 0; font-size: 13px;">Raw hardware/timestamp data found inside uploaded avatar image.</p>
+          <p style="font-size: 12px; font-family: monospace;">${data.detail}</p>
+        `;
+        letter.value = `Remediation Advice:\nStrip EXIF metadata using tools like ImageMagick or ExifTool before publishing images online:\nexiftool -all= photo.jpg`;
+      } else if (data.type === "leak") {
+        content.innerHTML = `
+          <span class="badge badge-leak">Biometric Correlation</span>
+          <p style="margin: 8px 0; font-size: 13px;">This account uses an identical or near-identical profile vector, linking it to target "${target}".</p>
+        `;
+        letter.value = `Cross-Account Correlation Alert:\nAn adversary can correlate pseudonym "${data.label}" with "${target}" using automated facial embeddings (>85% match). Change the profile image to prevent linking.`;
+      } else {
+        content.innerHTML = `<p style="font-size: 13px;">Target root entity: ${target}</p>`;
+        letter.value = "Target root selected.";
+      }
+    }
+
+    function closeInspector() { document.getElementById("inspector").style.display = "none"; }
+
+    function copyLetter() {
+      const t = document.getElementById("remediation_letter");
+      t.select();
+      navigator.clipboard.writeText(t.value);
+      alert("Notice copied to clipboard!");
+    }
+
+    function exportReport() {
+      if (!latestReport) return;
+      const blob = new Blob([JSON.stringify(latestReport, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `audit_report_${latestReport.target}.json`;
+      a.click();
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.DS_Store
+Thumbs.db
+qdrant_storage/
+*.json
+!audit_report_sample.json
+.vscode/
+.idea/
