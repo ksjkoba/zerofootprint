@@ -1,17 +1,24 @@
 import os
 import io
+import json
 import asyncio
 import httpx
 import torch
 import torchvision.transforms as transforms
 import torchvision.models as models
+from datetime import datetime
 from PIL import Image, ExifTags
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 app = FastAPI(title="ZeroFootprint Production Auditor")
 
@@ -48,7 +55,36 @@ def ensure_collection():
                 vectors_config=qmodels.VectorParams(size=512, distance=qmodels.Distance.COSINE),
             )
     except Exception as e:
-        print(f"[!] Qdrant init error: {e}")
+        print(f"[!] Qdrant init: {e}")
+
+# Dynamic Sherlock registry cache
+SHERLOCK_REGISTRY = {}
+SHERLOCK_URL = "https://raw.githubusercontent.com/sherlock-project/sherlock/master/sherlock_project/resources/data.json"
+
+@app.on_event("startup")
+async def load_sherlock_data():
+    global SHERLOCK_REGISTRY
+    ensure_collection()
+    local_cache = "/app/sherlock_data.json"
+    if os.path.exists(local_cache):
+        try:
+            with open(local_cache, "r", encoding="utf-8") as f:
+                SHERLOCK_REGISTRY = json.load(f)
+                return
+        except Exception:
+            pass
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(SHERLOCK_URL, timeout=10.0)
+            if res.status_code == 200:
+                data = res.json()
+                data.pop("$schema", None)
+                SHERLOCK_REGISTRY = data
+                with open(local_cache, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+    except Exception as e:
+        print(f"[!] Sherlock ingestion fallback: {e}")
 
 def extract_exif(image_bytes: bytes) -> dict:
     leaks = {}
@@ -77,136 +113,220 @@ def extract_embedding(image_bytes: bytes) -> list[float]:
     except Exception:
         return []
 
-REGISTRY = {
-    "GitHub": {"url": "https://api.github.com/users/{}", "type": "api", "avatar": "avatar_url", "profile": "https://github.com/{}"},
-    "GitLab": {"url": "https://gitlab.com/api/v4/users?username={}", "type": "api_list", "avatar": "avatar_url", "profile": "https://gitlab.com/{}"},
-    "Reddit": {"url": "https://www.reddit.com/user/{}/about.json", "type": "api", "avatar": "icon_img", "profile": "https://reddit.com/user/{}"},
-    "DevTo": {"url": "https://dev.to/api/users/by_username?url={}", "type": "api", "avatar": "profile_image", "profile": "https://dev.to/{}"},
-    "DockerHub": {"url": "https://hub.docker.com/v2/users/{}/", "type": "api", "avatar": None, "profile": "https://hub.docker.com/u/{}"},
-    "HackerNews": {"url": "https://hacker-news.firebaseio.com/v0/user/{}.json", "type": "api", "avatar": None, "profile": "https://news.ycombinator.com/user?id={}"},
-    "Keybase": {"url": "https://keybase.io/_/api/1.0/user/lookup.json?usernames={}", "type": "keybase", "avatar": None, "profile": "https://keybase.io/{}"},
-    "PyPI": {"url": "https://pypi.org/user/{}/", "type": "http", "avatar": None, "profile": "https://pypi.org/user/{}/"}
-}
+async def probe_sherlock(semaphore: asyncio.Semaphore, client: httpx.AsyncClient, name: str, site_data: dict, username: str):
+    url = site_data.get("url", "").replace("{}", username)
+    error_type = site_data.get("errorType", "status_code")
+    error_msg = site_data.get("errorMsg", "")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeroFootprint/2.0"}
 
-async def probe_service(client: httpx.AsyncClient, name: str, cfg: dict, username: str):
-    target_url = cfg["url"].format(username)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        res = await client.get(target_url, headers=headers, timeout=5.0, follow_redirects=True)
-        if res.status_code == 200:
-            avatar_url = None
-            if cfg["type"] == "api":
-                data = res.json()
-                if cfg.get("avatar"):
-                    avatar_url = data.get(cfg["avatar"])
-            elif cfg["type"] == "api_list":
-                data = res.json()
-                if isinstance(data, list) and len(data) > 0 and cfg.get("avatar"):
-                    avatar_url = data[0].get(cfg["avatar"])
-
-            if avatar_url and "?" in avatar_url and "reddit" in avatar_url:
-                avatar_url = avatar_url.split("?")[0]
-
-            return {
-                "platform": name,
-                "profile_url": cfg["profile"].format(username),
-                "avatar_url": avatar_url
-            }
-    except Exception:
-        pass
+    async with semaphore:
+        try:
+            res = await client.get(url, headers=headers, timeout=4.5, follow_redirects=True)
+            if error_type == "status_code":
+                if res.status_code == 200:
+                    return {"platform": name, "url": url}
+            elif error_type == "message":
+                if res.status_code == 200 and error_msg not in res.text:
+                    return {"platform": name, "url": url}
+            elif error_type == "response_url":
+                if res.status_code == 200 and error_msg not in str(res.url):
+                    return {"platform": name, "url": url}
+        except Exception:
+            pass
     return None
 
 @app.post("/api/audit")
 async def run_audit(username: str = Form(...), avatar: UploadFile = File(None)):
-    try:
-        ensure_collection()
-        nodes = [{"data": {"id": username, "label": f"Target: {username}", "type": "root"}}]
-        edges = []
-        exif_findings = {}
-        leak_matches = []
+    ensure_collection()
+    nodes = [{"data": {"id": username, "label": f"Target: {username}", "type": "root"}}]
+    edges = []
+    exif_findings = {}
+    leak_matches = []
 
-        # 1. Parallel platform reconnaissance
-        async with httpx.AsyncClient() as client:
-            tasks = [probe_service(client, name, cfg, username) for name, cfg in REGISTRY.items()]
-            results = await asyncio.gather(*tasks)
+    # Controlled concurrency worker pool
+    sem = asyncio.Semaphore(30)
+    async with httpx.AsyncClient() as client:
+        tasks = [probe_sherlock(sem, client, name, cfg, username) for name, cfg in SHERLOCK_REGISTRY.items()]
+        results = await asyncio.gather(*tasks)
 
-        exposed = [r for r in results if r]
+    exposed = [r for r in results if r]
 
-        # 2. Avatar extraction
-        avatar_bytes = await avatar.read() if avatar else None
+    avatar_bytes = await avatar.read() if avatar else None
 
-        async with httpx.AsyncClient() as img_client:
-            for item in exposed:
-                p_name = item["platform"]
-                nodes.append({
-                    "data": {
-                        "id": p_name,
-                        "label": p_name,
-                        "type": "platform",
-                        "url": item["profile_url"],
-                        "avatar_url": item.get("avatar_url")
-                    }
-                })
-                edges.append({"data": {"source": username, "target": p_name, "label": "registered"}})
-
-                if not avatar_bytes and item.get("avatar_url"):
-                    try:
-                        img_res = await img_client.get(item["avatar_url"], timeout=5.0, follow_redirects=True)
-                        if img_res.status_code == 200:
-                            avatar_bytes = img_res.content
-                    except Exception:
-                        pass
-
-        # 3. EXIF analysis and vector search
-        if avatar_bytes:
-            exif_findings = extract_exif(avatar_bytes)
-            for k, v in exif_findings.items():
-                meta_id = f"meta_{k}"
-                nodes.append({"data": {"id": meta_id, "label": f"{k}: {v}", "type": "meta", "detail": f"{k}: {v}"}})
-                edges.append({"data": {"source": username, "target": meta_id, "label": "exposes_exif"}})
-
-            vector = extract_embedding(avatar_bytes)
-            if vector:
-                point_id = abs(hash(username)) % 10000000
-                try:
-                    qclient.upsert(
-                        collection_name=COLLECTION_NAME,
-                        points=[qmodels.PointStruct(id=point_id, vector=vector, payload={"username": username})]
-                    )
-
-                    matches = qclient.search(collection_name=COLLECTION_NAME, query_vector=vector, limit=8)
-                    for m in matches:
-                        matched_user = m.payload.get("username") if m.payload else None
-                        if matched_user and matched_user != username and m.score > 0.85:
-                            leak_id = f"leak_{matched_user}"
-                            leak_matches.append({"username": matched_user, "similarity": round(m.score * 100, 1)})
-                            nodes.append({
-                                "data": {
-                                    "id": leak_id,
-                                    "label": f"Shared Identity: {matched_user} ({int(m.score * 100)}%)",
-                                    "type": "leak"
-                                }
-                            })
-                            edges.append({"data": {"source": username, "target": leak_id, "label": "biometric_match"}})
-                except Exception as q_err:
-                    print(f"[!] Qdrant query bypassed: {q_err}")
-
-        score = min(100, (len(exposed) * 8) + (len(exif_findings) * 20) + (len(leak_matches) * 25))
-
-        return JSONResponse({
-            "target": username,
-            "exposure_score": score,
-            "exposure_count": len(exposed),
-            "exif_leaks": exif_findings,
-            "biometric_leaks": leak_matches,
-            "elements": {"nodes": nodes, "edges": edges}
+    # Graph construction
+    for item in exposed:
+        p_name = item["platform"]
+        nodes.append({
+            "data": {
+                "id": p_name,
+                "label": p_name,
+                "type": "platform",
+                "url": item["url"],
+                "avatar_url": None
+            }
         })
+        edges.append({"data": {"source": username, "target": p_name, "label": "registered"}})
 
-    except Exception as general_err:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(general_err)}
-        )
+    # EXIF & Vector search
+    if avatar_bytes:
+        exif_findings = extract_exif(avatar_bytes)
+        for k, v in exif_findings.items():
+            meta_id = f"meta_{k}"
+            nodes.append({"data": {"id": meta_id, "label": f"{k}: {v}", "type": "meta", "detail": f"{k}: {v}"}})
+            edges.append({"data": {"source": username, "target": meta_id, "label": "exposes_exif"}})
+
+        vector = extract_embedding(avatar_bytes)
+        if vector:
+            point_id = abs(hash(username)) % 10000000
+            try:
+                qclient.upsert(
+                    collection_name=COLLECTION_NAME,
+                    points=[qmodels.PointStruct(id=point_id, vector=vector, payload={"username": username})]
+                )
+                matches = qclient.search(collection_name=COLLECTION_NAME, query_vector=vector, limit=8)
+                for m in matches:
+                    matched_user = m.payload.get("username") if m.payload else None
+                    if matched_user and matched_user != username and m.score > 0.85:
+                        leak_id = f"leak_{matched_user}"
+                        leak_matches.append({"username": matched_user, "similarity": round(m.score * 100, 1)})
+                        nodes.append({
+                            "data": {
+                                "id": leak_id,
+                                "label": f"Shared Identity: {matched_user} ({int(m.score * 100)}%)",
+                                "type": "leak"
+                            }
+                        })
+                        edges.append({"data": {"source": username, "target": leak_id, "label": "biometric_match"}})
+            except Exception as q_err:
+                print(f"[!] Qdrant matching error: {q_err}")
+
+    score = min(100, (len(exposed) * 4) + (len(exif_findings) * 20) + (len(leak_matches) * 25))
+
+    return JSONResponse({
+        "target": username,
+        "exposure_score": score,
+        "exposure_count": len(exposed),
+        "exif_leaks": exif_findings,
+        "biometric_leaks": leak_matches,
+        "platforms": [e["platform"] for e in exposed],
+        "elements": {"nodes": nodes, "edges": edges}
+    })
+
+@app.post("/api/export-pdf")
+async def generate_pdf(payload: dict):
+    target = payload.get("target", "Target")
+    score = payload.get("exposure_score", 0)
+    exposure_count = payload.get("exposure_count", 0)
+    exif_leaks = payload.get("exif_leaks", {})
+    biometric_leaks = payload.get("biometric_leaks", [])
+    platforms = payload.get("platforms", [])
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+
+    header_style = ParagraphStyle(
+        'HeaderStyle',
+        parent=styles['Heading1'],
+        fontSize=20,
+        textColor=colors.HexColor("#1e293b"),
+        spaceAfter=6
+    )
+    sub_style = ParagraphStyle(
+        'SubStyle',
+        parent=styles['Normal'],
+        fontSize=10,
+        textColor=colors.HexColor("#64748b"),
+        spaceAfter=14
+    )
+    section_style = ParagraphStyle(
+        'SecStyle',
+        parent=styles['Heading2'],
+        fontSize=13,
+        textColor=colors.HexColor("#0f172a"),
+        spaceBefore=12,
+        spaceAfter=8
+    )
+
+    story = []
+    story.append(Paragraph("ZeroFootprint Attack Surface Audit Report", header_style))
+    story.append(Paragraph(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} | Identity Target: <b>{target}</b>", sub_style))
+
+    # Metric Summary Table
+    risk_level = "CRITICAL" if score >= 70 else ("ELEVATED" if score >= 35 else "MINIMAL")
+    score_data = [
+        ["Metric", "Audit Finding"],
+        ["Exposure Score", f"{score} / 100 ({risk_level})"],
+        ["Discovered Public Endpoints", f"{exposure_count} exposed services"],
+        ["EXIF Metadata Leaks", f"{len(exif_leaks)} attributes detected"],
+        ["Cross-Profile Vector Leaks", f"{len(biometric_leaks)} identity correlations"]
+    ]
+    t_summary = Table(score_data, colWidths=[200, 340])
+    t_summary.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+    ]))
+    story.append(t_summary)
+
+    # Exposed Platforms Table
+    story.append(Paragraph("Exposed Profile Endpoints", section_style))
+    p_data = [["Platform", "Registry Status"]]
+    for p in platforms[:30]:
+        p_data.append([p, "Active Public Profile Discovered"])
+    if len(platforms) > 30:
+        p_data.append([f"...and {len(platforms) - 30} more", "Truncated for document brevity"])
+    if len(platforms) == 0:
+        p_data.append(["None", "No public profile registrations discovered."])
+
+    t_platforms = Table(p_data, colWidths=[200, 340])
+    t_platforms.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+    ]))
+    story.append(t_platforms)
+
+    # EXIF & Biometric Findings
+    if exif_leaks or biometric_leaks:
+        story.append(Paragraph("Telemetry & Identity Association Findings", section_style))
+        leak_data = [["Leak Type", "Finding Details"]]
+        for k, v in exif_leaks.items():
+            leak_data.append([f"EXIF: {k}", str(v)])
+        for b in biometric_leaks:
+            leak_data.append(["Shared Avatar Vector", f"{b['username']} ({b['similarity']}% similarity)"])
+
+        t_leaks = Table(leak_data, colWidths=[200, 340])
+        t_leaks.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#7f1d1d")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        story.append(t_leaks)
+
+    story.append(Paragraph("Remediation Notice", section_style))
+    story.append(Paragraph(
+        "To exercise your statutory Right to Erasure under GDPR Article 17 and CCPA § 1798.105, "
+        "send formal deletion requests to the respective Data Protection Officers of the exposed services.",
+        sub_style
+    ))
+
+    doc.build(story)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=ZeroFootprint_Report_{target}.pdf"}
+    )
 
 app.mount("/static", StaticFiles(directory="/app/frontend"), name="static")
 

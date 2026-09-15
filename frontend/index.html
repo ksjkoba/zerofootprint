@@ -7,7 +7,7 @@
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f19; color: #f1f5f9; display: flex; height: 100vh; overflow: hidden; }
-    #sidebar { width: 340px; min-width: 340px; padding: 22px; background: #111827; border-right: 1px solid #1f2937; display: flex; flex-direction: column; gap: 14px; z-index: 10; overflow-y: auto; }
+    #sidebar { width: 340px; min-width: 340px; padding: 22px; background: #111827; border-right: 1px solid #1f2937; display: flex; flex-direction: column; gap: 12px; z-index: 10; overflow-y: auto; }
     #graph { flex: 1; height: 100%; position: relative; }
     #inspector { width: 380px; min-width: 380px; padding: 22px; background: #111827; border-left: 1px solid #1f2937; display: none; flex-direction: column; gap: 14px; overflow-y: auto; }
 
@@ -23,13 +23,17 @@
     .badge-meta { background: #78350f; color: #fcd34d; }
     .badge-leak { background: #7f1d1d; color: #f87171; }
     .status-text { font-size: 12px; color: #9ca3af; line-height: 1.4; }
+    .btn-secondary { background: #374151; }
+    .btn-secondary:hover { background: #4b5563; }
+    .btn-pdf { background: #059669; }
+    .btn-pdf:hover { background: #047857; }
   </style>
 </head>
 <body>
 
   <div id="sidebar">
     <h2 style="margin: 0; font-size: 18px; color: #60a5fa;">ZeroFootprint Auditor</h2>
-    <p class="status-text" style="margin: 0;">Map exposed endpoints, biometric overlaps, and unstripped EXIF metadata.</p>
+    <p class="status-text" style="margin: 0;">Sherlock 400+ Engine, Vector Similarity & EXIF Inspector.</p>
     
     <label style="font-size: 12px; font-weight: 600; text-transform: uppercase; color: #9ca3af;">Target Alias:</label>
     <input type="text" id="target_user" placeholder="e.g. octocat" required>
@@ -46,7 +50,8 @@
       <div id="score_label" style="font-size: 11px; font-weight: bold;">LOW EXPOSURE</div>
     </div>
 
-    <button id="btn_export" onclick="exportReport()" style="display: none; background: #374151;">Export JSON Audit Report</button>
+    <button id="btn_pdf" class="btn-pdf" onclick="exportPDF()" style="display: none;">Download PDF Audit Report</button>
+    <button id="btn_export" class="btn-secondary" onclick="exportReport()" style="display: none;">Export JSON Audit Report</button>
   </div>
 
   <div id="graph"></div>
@@ -62,7 +67,7 @@
     <div class="card">
       <h4 style="margin: 0 0 6px 0; font-size: 13px;">Remediation Request</h4>
       <textarea id="remediation_letter" rows="8" readonly style="font-size: 11px; font-family: monospace;"></textarea>
-      <button onclick="copyLetter()" style="margin-top: 8px; background: #374151;">Copy Notice to Clipboard</button>
+      <button class="btn-secondary" onclick="copyLetter()" style="margin-top: 8px;">Copy Notice to Clipboard</button>
     </div>
   </div>
 
@@ -76,7 +81,7 @@
       const status = document.getElementById("status");
 
       if (!user) return alert("Please enter a username");
-      status.innerText = "Enumerating accounts, extracting EXIF & vectors...";
+      status.innerText = "Probing Sherlock registry across 400+ platforms...";
       closeInspector();
 
       const fd = new FormData();
@@ -85,17 +90,14 @@
 
       try {
         const res = await fetch("/api/audit", { method: "POST", body: fd });
-        if (!res.ok) {
-          const errData = await res.json().catch(() => null);
-          const errMsg = errData?.error || `Server responded with status ${res.status}`;
-          throw new Error(errMsg);
-        }
+        if (!res.ok) throw new Error(`Server returned HTTP ${res.status}`);
 
         const data = await res.json();
         latestReport = data;
 
-        status.innerText = `Audit complete. Found ${data.exposure_count} endpoints.`;
+        status.innerText = `Audit complete. Discovered ${data.exposure_count} public endpoints across Sherlock registry.`;
         renderScore(data.exposure_score);
+        document.getElementById("btn_pdf").style.display = "block";
         document.getElementById("btn_export").style.display = "block";
 
         cy = cytoscape({
@@ -155,7 +157,6 @@
         content.innerHTML = `
           <span class="badge badge-exposed">Public Endpoint</span>
           <p style="margin: 8px 0; font-size: 13px;"><strong>Profile:</strong> <a href="${data.url}" target="_blank" style="color: #60a5fa;">${data.url}</a></p>
-          ${data.avatar_url ? `<p style="font-size: 12px; margin: 4px 0;"><strong>Avatar:</strong> <a href="${data.avatar_url}" target="_blank" style="color: #60a5fa;">Scraped Image</a></p>` : ''}
         `;
         letter.value = `Subject: GDPR Article 17 Erasure Request / CCPA Deletion Notice\n\nTo the Data Privacy Officer at ${data.label},\n\nI am formally requesting the permanent deletion of all personal data, telemetry, and records associated with identifier "${target}" (${data.url}) pursuant to GDPR Article 17 and CCPA § 1798.105.\n\nPlease confirm compliance within 30 days.\n\nRegards,\n[Your Name]`;
       } else if (data.type === "meta") {
@@ -164,13 +165,13 @@
           <p style="margin: 8px 0; font-size: 13px;">Raw hardware/timestamp data found inside uploaded avatar image.</p>
           <p style="font-size: 12px; font-family: monospace;">${data.detail}</p>
         `;
-        letter.value = `Remediation Advice:\nStrip EXIF metadata using tools like ImageMagick or ExifTool before publishing images online:\nexiftool -all= photo.jpg`;
+        letter.value = `Remediation Advice:\nStrip EXIF metadata using tools like ExifTool before publishing images:\nexiftool -all= photo.jpg`;
       } else if (data.type === "leak") {
         content.innerHTML = `
           <span class="badge badge-leak">Biometric Correlation</span>
           <p style="margin: 8px 0; font-size: 13px;">This account uses an identical or near-identical profile vector, linking it to target "${target}".</p>
         `;
-        letter.value = `Cross-Account Correlation Alert:\nAn adversary can correlate pseudonym "${data.label}" with "${target}" using automated facial embeddings (>85% match). Change the profile image to prevent linking.`;
+        letter.value = `Cross-Account Correlation Alert:\nAn adversary can correlate pseudonym "${data.label}" with "${target}" using automated facial embeddings (>85% match).`;
       } else {
         content.innerHTML = `<p style="font-size: 13px;">Target root entity: ${target}</p>`;
         letter.value = "Target root selected.";
@@ -193,6 +194,24 @@
       a.href = URL.createObjectURL(blob);
       a.download = `audit_report_${latestReport.target}.json`;
       a.click();
+    }
+
+    async function exportPDF() {
+      if (!latestReport) return;
+      try {
+        const res = await fetch("/api/export-pdf", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(latestReport)
+        });
+        const blob = await res.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `ZeroFootprint_Report_${latestReport.target}.pdf`;
+        a.click();
+      } catch (err) {
+        alert("PDF generation failed: " + err.message);
+      }
     }
   </script>
 </body>
