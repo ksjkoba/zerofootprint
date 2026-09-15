@@ -1,4 +1,4 @@
-import os
+ï»¿import os
 import io
 import json
 import asyncio
@@ -315,7 +315,7 @@ async def generate_pdf(payload: dict):
 
     story.append(Paragraph("Remediation Notice", section_style))
     story.append(Paragraph(
-        "To exercise your statutory Right to Erasure under GDPR Article 17 and CCPA § 1798.105, "
+        "To exercise your statutory Right to Erasure under GDPR Article 17 and CCPA Section  1798.105, "
         "send formal deletion requests to the respective Data Protection Officers of the exposed services.",
         sub_style
     ))
